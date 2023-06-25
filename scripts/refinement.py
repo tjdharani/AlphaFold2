@@ -14,9 +14,7 @@ except ModuleNotFoundError:
     warnings.warn(msg) # no pyRosetta was found
 
 
-
 ### ROSETTA STUFF ###
-
 
 def pdb2rosetta(route):
     """ Takes pdb file route(s) as input and returns rosetta pose(s). 
@@ -68,8 +66,7 @@ def run_fast_relax(config_route, pdb_route=None, pose=None):
     config = json.load(config_route)
     # run fast relax pipeline - examples:
     # https://colab.research.google.com/github/RosettaCommons/PyRosetta.notebooks/blob/master/notebooks/06.02-Packing-design-and-regional-relax.ipynb#scrollTo=PYr025Rn1Q8i
-    # https://nbviewer.jupyter.org/github/RosettaCommons/PyRosetta.notebooks/blob/master/notebooks/06.03-Design-with-a-resfile-and-relax.ipynb
-    # https://faculty.washington.edu/dimaio/files/demo2.py
+   
     raise NotImplementedError("Last step. Not implemented yet.")
 
 
