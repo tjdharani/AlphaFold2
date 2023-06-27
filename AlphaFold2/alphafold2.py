@@ -523,3 +523,130 @@ class Alphafold2(nn.Module):
             nn.GELU(),
             nn.Linear(dim, dim)
         )
+
+        self.predict_angles = predict_angles
+        self.symmetrize_omega = symmetrize_omega
+
+        if predict_angles:
+            self.to_prob_theta = nn.Linear(dim, constants.THETA_BUCKETS)
+            self.to_prob_phi   = nn.Linear(dim, constants.PHI_BUCKETS)
+            self.to_prob_omega = nn.Linear(dim, constants.OMEGA_BUCKETS)
+
+        # custom embedding projection
+
+        self.embedd_project = nn.Linear(num_embedds, dim)
+
+        # main trunk modules
+
+        self.net = Evoformer(
+            dim = dim,
+            depth = depth,
+            seq_len = max_seq_len,
+            heads = heads,
+            dim_head = dim_head,
+            attn_dropout = attn_dropout,
+            ff_dropout = ff_dropout
+        )
+
+        self.mlm = MLM(
+            dim = dim,
+            num_tokens = num_tokens,
+            mask_id = num_tokens, # last token of embedding is used for masking
+            mask_prob = mlm_mask_prob,
+            keep_token_same_prob = mlm_keep_token_same_prob,
+            random_replace_token_prob = mlm_random_replace_token_prob,
+            exclude_token_ids = mlm_exclude_token_ids
+        )
+
+        # calculate distogram logits
+
+        self.to_distogram_logits = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, constants.DISTOGRAM_BUCKETS)
+        )
+
+        # to coordinate output
+
+        self.predict_coords = predict_coords
+        self.structure_module_depth = structure_module_depth
+
+        self.msa_to_single_repr_dim = nn.Linear(dim, dim)
+        self.trunk_to_pairwise_repr_dim = nn.Linear(dim, dim)
+
+        with torch_default_dtype(torch.float32):
+            self.ipa_block = IPABlock(
+                dim = dim,
+                heads = structure_module_heads,
+            )
+
+            self.to_quaternion_update = nn.Linear(dim, 6)
+
+        init_zero_(self.ipa_block.attn.to_out)
+
+        self.to_points = nn.Linear(dim, 3)
+
+        self.lddt_linear = nn.Linear(dim, 1)
+
+        self.recycling_msa_norm = nn.LayerNorm(dim)
+        self.recycling_pairwise_norm = nn.LayerNorm(dim)
+        self.recycling_distance_embed = nn.Embedding(recycling_distance_buckets, dim)
+        self.recycling_distance_buckets = recycling_distance_buckets
+
+    def forward(
+        self,
+        seq,
+        msa = None,
+        mask = None,
+        msa_mask = None,
+        extra_msa = None,
+        extra_msa_mask = None,
+        seq_index = None,
+        seq_embed = None,
+        msa_embed = None,
+        templates_feats = None,
+        templates_mask = None,
+        templates_angles = None,
+        embedds = None,
+        recyclables = None,
+        return_trunk = False,
+        return_confidence = False,
+        return_recyclables = False,
+        return_aux_logits = False
+    ):
+        assert not (self.disable_token_embed and not exists(seq_embed)), 'sequence embedding must be supplied if one has disabled token embedding'
+        assert not (self.disable_token_embed and not exists(msa_embed)), 'msa embedding must be supplied if one has disabled token embedding'
+
+        # if MSA is not passed in, just use the sequence itself
+
+        if not exists(msa):
+            msa = rearrange(seq, 'b n -> b () n')
+            msa_mask = rearrange(mask, 'b n -> b () n')
+
+        # assert on sequence length
+
+        assert msa.shape[-1] == seq.shape[-1], 'sequence length of MSA and primary sequence must be the same'
+
+        # variables
+
+        b, n, device = *seq.shape[:2], seq.device
+        n_range = torch.arange(n, device = device)
+
+        # unpack (AA_code, atom_pos)
+
+        if isinstance(seq, (list, tuple)):
+            seq, seq_pos = seq
+
+        x = self.token_emb(seq)
+
+        if exists(seq_embed):
+            x += seq_embed
+
+        # mlm for MSAs
+
+        if self.training and exists(msa):
+            original_msa = msa
+            msa_mask = default(msa_mask, lambda: torch.ones_like(msa).bool())
+
+            noised_msa, replaced_msa_mask = self.mlm.noise(msa, msa_mask)
+            msa = noised_msa
+
