@@ -650,3 +650,199 @@ class Alphafold2(nn.Module):
             noised_msa, replaced_msa_mask = self.mlm.noise(msa, msa_mask)
             msa = noised_msa
 
+        if exists(msa):
+            m = self.token_emb(msa)
+
+            if exists(msa_embed):
+                m = m + msa_embed
+
+            # add single representation to msa representation
+
+            m = m + rearrange(x, 'b n d -> b () n d')
+
+            # get msa_mask to all ones if none was passed
+            msa_mask = default(msa_mask, lambda: torch.ones_like(msa).bool())
+
+        elif exists(embedds):
+            m = self.embedd_project(embedds)
+            
+            # get msa_mask to all ones if none was passed
+            msa_mask = default(msa_mask, lambda: torch.ones_like(embedds[..., -1]).bool())
+        else:
+            raise Error('either MSA or embeds must be given')
+
+        x_left, x_right = self.to_pairwise_repr(x).chunk(2, dim = -1)
+        x = rearrange(x_left, 'b i d -> b i () d') + rearrange(x_right, 'b j d-> b () j d') # create pair-wise residue embeds
+        x_mask = rearrange(mask, 'b i -> b i ()') * rearrange(mask, 'b j -> b () j') if exists(mask) else None
+
+        # add relative positional embedding
+
+        seq_index = default(seq_index, lambda: torch.arange(n, device = device))
+        seq_rel_dist = rearrange(seq_index, 'i -> () i ()') - rearrange(seq_index, 'j -> () () j')
+        seq_rel_dist = seq_rel_dist.clamp(-self.max_rel_dist, self.max_rel_dist) + self.max_rel_dist
+        rel_pos_emb = self.pos_emb(seq_rel_dist)
+
+        x = x + rel_pos_emb
+
+        if exists(recyclables):
+            m[:, 0] = m[:, 0] + self.recycling_msa_norm(recyclables.single_msa_repr_row)
+            x = x + self.recycling_pairwise_norm(recyclables.pairwise_repr)
+
+            distances = torch.cdist(recyclables.coords, recyclables.coords, p=2)
+            boundaries = torch.linspace(2, 20, steps = self.recycling_distance_buckets, device = device)
+            discretized_distances = torch.bucketize(distances, boundaries[:-1])
+            distance_embed = self.recycling_distance_embed(discretized_distances)
+
+            x = x + distance_embed
+
+        # embed templates, if present
+
+        if exists(templates_feats):
+            _, num_templates, *_ = templates_feats.shape
+
+            # embed template
+
+            t = self.to_template_embed(templates_feats)
+            t_mask_crossed = rearrange(templates_mask, 'b t i -> b t i ()') * rearrange(templates_mask, 'b t j -> b t () j')
+
+            t = rearrange(t, 'b t ... -> (b t) ...')
+            t_mask_crossed = rearrange(t_mask_crossed, 'b t ... -> (b t) ...')
+
+            for _ in range(self.templates_embed_layers):
+                t = self.template_pairwise_embedder(t, mask = t_mask_crossed)
+
+            t = rearrange(t, '(b t) ... -> b t ...', t = num_templates)
+            t_mask_crossed = rearrange(t_mask_crossed, '(b t) ... -> b t ...', t = num_templates)
+
+            # template pos emb
+
+            x_point = rearrange(x, 'b i j d -> (b i j) () d')
+            t_point = rearrange(t, 'b t i j d -> (b i j) t d')
+            x_mask_point = rearrange(x_mask, 'b i j -> (b i j) ()')
+            t_mask_point = rearrange(t_mask_crossed, 'b t i j -> (b i j) t')
+
+            template_pooled = self.template_pointwise_attn(
+                x_point,
+                context = t_point,
+                mask = x_mask_point,
+                context_mask = t_mask_point
+            )
+
+            template_pooled_mask = rearrange(t_mask_point.sum(dim = -1) > 0, 'b -> b () ()')
+            template_pooled = template_pooled * template_pooled_mask
+
+            template_pooled = rearrange(template_pooled, '(b i j) () d -> b i j d', i = n, j = n)
+            x = x + template_pooled
+
+        if exists(templates_angles):
+            t_angle_feats = self.template_angle_mlp(templates_angles)
+            m = torch.cat((m, t_angle_feats), dim = 1)
+            msa_mask = torch.cat((msa_mask, templates_mask), dim = 1)
+
+        # embed extra msa, if present
+
+        if exists(extra_msa):
+            extra_m = self.token_emb(msa)
+            extra_msa_mask = default(extra_msa_mask, torch.ones_like(extra_m).bool())
+
+            x, extra_m = self.extra_msa_evoformer(
+                x,
+                extra_m,
+                mask = x_mask,
+                msa_mask = extra_msa_mask
+            )
+
+        x, m = self.net(
+            x,
+            m,
+            mask = x_mask,
+            msa_mask = msa_mask
+        )
+
+        # ready output container
+
+        ret = ReturnValues()
+
+        # calculate theta and phi before symmetrization
+
+        if self.predict_angles:
+            ret.theta_logits = self.to_prob_theta(x)
+            ret.phi_logits = self.to_prob_phi(x)
+
+        # embeds to distogram
+
+        trunk_embeds = (x + rearrange(x, 'b i j d -> b j i d')) * 0.5  # symmetrize
+        distance_pred = self.to_distogram_logits(trunk_embeds)
+        ret.distance = distance_pred
+
+        msa_mlm_loss = None
+        if self.training and exists(msa):
+            num_msa = original_msa.shape[1]
+            msa_mlm_loss = self.mlm(m[:, :num_msa], original_msa, replaced_msa_mask)
+
+        # determine angles, if specified
+
+        if self.predict_angles:
+            omega_input = trunk_embeds if self.symmetrize_omega else x
+            ret.omega_logits = self.to_prob_omega(omega_input)
+
+        if not self.predict_coords or return_trunk:
+            return ret
+
+        # derive single and pairwise embeddings for structural refinement
+
+        single_msa_repr_row = m[:, 0]
+
+        single_repr = self.msa_to_single_repr_dim(single_msa_repr_row)
+        pairwise_repr = self.trunk_to_pairwise_repr_dim(x)
+
+        original_dtype = single_repr.dtype
+        single_repr, pairwise_repr = map(lambda t: t.float(), (single_repr, pairwise_repr))
+
+        with torch_default_dtype(torch.float32):
+
+            quaternions = torch.tensor([1., 0., 0., 0.], device = device) # initial rotations
+            quaternions = repeat(quaternions, 'd -> b n d', b = b, n = n)
+            translations = torch.zeros((b, n, 3), device = device)
+
+            for i in range(self.structure_module_depth):
+                is_last = i == (self.structure_module_depth - 1)
+
+                rotations = quaternion_to_matrix(quaternions)
+
+                if not is_last:
+                    rotations = rotations.detach()
+
+                single_repr = self.ipa_block(
+                    single_repr,
+                    mask = mask,
+                    pairwise_repr = pairwise_repr,
+                    rotations = rotations,
+                    translations = translations
+                )
+
+                # update quaternion and translation
+
+                quaternion_update, translation_update = self.to_quaternion_update(single_repr).chunk(2, dim = -1)
+                quaternion_update = F.pad(quaternion_update, (1, 0), value = 1.)
+
+                quaternions = quaternion_multiply(quaternions, quaternion_update)
+                translations = translations + einsum('b n c, b n c r -> b n r', translation_update, rotations)
+
+            points_local = self.to_points(single_repr)
+            rotations = quaternion_to_matrix(quaternions)
+            coords = einsum('b n c, b n c d -> b n d', points_local, rotations) + translations
+
+        coords.type(original_dtype)
+
+        if return_recyclables:
+            coords, single_msa_repr_row, pairwise_repr = map(torch.detach, (coords, single_msa_repr_row, pairwise_repr))
+            ret.recyclables = Recyclables(coords, single_msa_repr_row, pairwise_repr)
+
+        if return_aux_logits:
+            return coords, ret
+
+        if return_confidence:
+            return coords, self.lddt_linear(single_repr.float())
+
+        return coords
