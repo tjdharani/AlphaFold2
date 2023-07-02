@@ -7,6 +7,7 @@ notes.md
 *.config
 end2end.py
 tests/custom_tests.py
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
